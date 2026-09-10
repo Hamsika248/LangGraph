@@ -352,12 +352,13 @@ def extract_agent_output(state):
 # ============================================================
 # 11. CREATE LANGSERVE CHAIN
 # ============================================================
-
 formatted_agent_chain = (
     RunnableLambda(format_for_agent)
     | agent
     | RunnableLambda(extract_agent_output)
-)
+).with_types(input_type=AgentInput)
+
+
 
 
 # ============================================================
