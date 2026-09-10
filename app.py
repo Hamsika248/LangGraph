@@ -3,6 +3,7 @@ import uvicorn
 
 from fastapi import FastAPI
 from langserve import add_routes
+from pydantic import BaseModel
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
@@ -25,16 +26,14 @@ if not GEMINI_API_KEY:
 
 
 # ============================================================
-# 2. INITIALIZE GEMINI MODEL
+# 2. INITIALIZE GEMINI
 # ============================================================
 
-llm_flash = ChatGoogleGenerativeAI(
+llm = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite-preview",
     google_api_key=GEMINI_API_KEY,
     temperature=0
 )
-
-llm = llm_flash
 
 
 # ============================================================
@@ -49,12 +48,12 @@ class CrewState(TypedDict):
 
 
 # ============================================================
-# 4. TOOL - RUN PYTHON CODE
+# 4. RUN PYTHON CODE
 # ============================================================
 
 @tool
 def run_python_code(code: str) -> str:
-    """Execute Python code and return standard output or error."""
+    """Execute Python code and return the output."""
 
     import sys
     import io
@@ -63,7 +62,6 @@ def run_python_code(code: str) -> str:
     if not isinstance(code, str):
         code = str(code)
 
-    # Remove markdown code fences if Gemini returns them
     clean_code = (
         code
         .replace("```python", "")
@@ -77,6 +75,7 @@ def run_python_code(code: str) -> str:
     sys.stdout = new_stdout
 
     try:
+
         local_scope = {}
 
         exec(clean_code, {}, local_scope)
@@ -84,9 +83,14 @@ def run_python_code(code: str) -> str:
         result = new_stdout.getvalue()
 
     except Exception:
-        result = f"Execution Error:\n{traceback.format_exc()}"
+
+        result = (
+            "Execution Error:\n"
+            + traceback.format_exc()
+        )
 
     finally:
+
         sys.stdout = old_stdout
 
     if result.strip():
@@ -96,18 +100,17 @@ def run_python_code(code: str) -> str:
 
 
 # ============================================================
-# 5. TOOL - GENERATE TEST CASES
+# 5. GENERATE TEST CASES
 # ============================================================
 
 @tool
 def generate_test_cases(task_description: str) -> str:
-    """Generate 3 to 5 test scenarios for a coding task."""
+    """Generate test scenarios for a coding task."""
 
     prompt = f"""
 You are a Senior QA Engineer.
 
-Generate 3 to 5 highly specific test scenarios
-for the following coding task:
+Generate 3 to 5 test scenarios for this coding task:
 
 {task_description}
 
@@ -116,7 +119,7 @@ Include:
 2. Edge cases
 3. Boundary cases where applicable
 
-Return them as a numbered list.
+Return the test scenarios as a numbered list.
 """
 
     response = llm.invoke(prompt)
@@ -149,10 +152,10 @@ def developer_node(state: CrewState):
 
     task = state["messages"][-1].content
 
-    dev_prompt = f"""
+    prompt = f"""
 You are a Python Developer.
 
-Write a clean Python program to solve the following coding task:
+Write a clean Python program to solve this coding task:
 
 {task}
 
@@ -163,7 +166,7 @@ Rules:
 - The code must be executable.
 """
 
-    response = llm_flash.invoke(dev_prompt)
+    response = llm.invoke(prompt)
 
     content = response.content
 
@@ -180,22 +183,22 @@ Rules:
             else:
                 code_parts.append(str(item))
 
-        code_str = "\n".join(code_parts)
+        code = "\n".join(code_parts)
 
     else:
 
-        code_str = str(content)
+        code = str(content)
 
-    # Remove markdown fences if present
-    code_str = (
-        code_str
+    # Remove Markdown code fences
+    code = (
+        code
         .replace("```python", "")
         .replace("```", "")
         .strip()
     )
 
     return {
-        "code": code_str
+        "code": code
     }
 
 
@@ -207,29 +210,15 @@ def tester_node(state: CrewState):
 
     task = state["messages"][-1].content
 
-    # --------------------------------------------------------
-    # Generate test scenarios
-    # --------------------------------------------------------
+    # Generate test cases
+    test_cases = generate_test_cases.invoke(task)
 
-    test_cases = generate_test_cases.invoke(
-        task
-    )
-
-    cases_str = str(test_cases)
-
-    # --------------------------------------------------------
-    # Execute generated Python code
-    # --------------------------------------------------------
-
+    # Execute generated code
     execution_result = run_python_code.invoke(
         {
             "code": state["code"]
         }
     )
-
-    # --------------------------------------------------------
-    # Create final report
-    # --------------------------------------------------------
 
     report = f"""
 ### EXECUTION OUTPUT
@@ -237,9 +226,9 @@ def tester_node(state: CrewState):
 {execution_result}
 
 
-### TEST SCENARIOS EVALUATED
+### TEST SCENARIOS
 
-{cases_str}
+{test_cases}
 """
 
     return {
@@ -248,13 +237,11 @@ def tester_node(state: CrewState):
 
 
 # ============================================================
-# 8. CREATE LANGGRAPH WORKFLOW
+# 8. CREATE LANGGRAPH
 # ============================================================
 
 workflow = StateGraph(CrewState)
 
-
-# Add nodes
 workflow.add_node(
     "developer",
     developer_node
@@ -265,50 +252,46 @@ workflow.add_node(
     tester_node
 )
 
-
-# Starting point
 workflow.add_edge(
     START,
     "developer"
 )
 
-
-# Developer → Tester
 workflow.add_edge(
     "developer",
     "tester"
 )
 
-
-# Tester → End
 workflow.add_edge(
     "tester",
     END
 )
 
-
-# Compile LangGraph
 agent = workflow.compile()
 
 
 # ============================================================
-# 9. FORMAT INPUT FOR LANGGRAPH
+# 9. LANGSERVE INPUT MODEL
 # ============================================================
 
-class AgentInput(TypedDict):
+class AgentInput(BaseModel):
     input: str
 
 
-def format_for_agent(x):
+# ============================================================
+# 10. RUN THE GRAPH
+# ============================================================
 
-    # Handle dictionary input from LangServe
+def run_agent(x):
+
+    # Get user's input
     if isinstance(x, dict):
         user_input = x["input"]
-
     else:
         user_input = x.input
 
-    return {
+    # Create initial LangGraph state
+    initial_state = {
         "messages": [
             HumanMessage(
                 content=user_input
@@ -319,64 +302,50 @@ def format_for_agent(x):
         "report": None
     }
 
+    # IMPORTANT:
+    # Actually invoke the LangGraph
+    result = agent.invoke(initial_state)
+
+    return result
+
 
 # ============================================================
-# 10. FORMAT OUTPUT FOR PLAYGROUND
+# 11. FORMAT OUTPUT
 # ============================================================
 
 def extract_agent_output(state):
 
-    if not isinstance(state, dict):
-
-        return {
-            "generated_code": str(state),
-            "report": ""
-        }
-
-    generated_code = state.get(
-        "code",
-        ""
-    )
-
-    report = state.get(
-        "report",
-        ""
-    )
-
     return {
-        "generated_code": generated_code or "",
-        "report": report or ""
+        "generated_code": state.get("code", "") or "",
+        "report": state.get("report", "") or ""
     }
 
 
 # ============================================================
-# 11. CREATE LANGSERVE CHAIN
+# 12. CREATE LANGSERVE CHAIN
 # ============================================================
+
 formatted_agent_chain = (
-    RunnableLambda(format_for_agent)
-    | agent
+    RunnableLambda(run_agent)
     | RunnableLambda(extract_agent_output)
-).with_types(input_type=AgentInput)
-
-
+).with_types(
+    input_type=AgentInput
+)
 
 
 # ============================================================
-# 12. FASTAPI APPLICATION
+# 13. FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="LangGraph Coding Agent",
-    description=(
-        "A LangGraph Developer and Tester "
-        "Coding Agent"
-    ),
+    description="LangGraph Developer and Tester Coding Agent",
     version="1.0"
 )
 
 
 # ============================================================
-# 13. EXPOSE AGENT THROUGH LANGSERVE
+# 14. LANGSERVE ROUTE
 # ============================================================
 
 add_routes(
@@ -388,7 +357,7 @@ add_routes(
 
 
 # ============================================================
-# 14. ROOT ENDPOINT
+# 15. ROOT ENDPOINT
 # ============================================================
 
 @app.get("/")
@@ -401,7 +370,7 @@ def home():
 
 
 # ============================================================
-# 15. START SERVER
+# 16. START SERVER
 # ============================================================
 
 if __name__ == "__main__":
