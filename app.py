@@ -1,4 +1,3 @@
-
 import os
 import uvicorn
 
@@ -50,12 +49,12 @@ class CrewState(TypedDict):
 
 
 # ============================================================
-# 4. TOOLS
+# 4. TOOL - RUN PYTHON CODE
 # ============================================================
 
 @tool
 def run_python_code(code: str) -> str:
-    """Execute Python code and return the output or error."""
+    """Execute Python code and return standard output or error."""
 
     import sys
     import io
@@ -64,6 +63,7 @@ def run_python_code(code: str) -> str:
     if not isinstance(code, str):
         code = str(code)
 
+    # Remove markdown code fences if Gemini returns them
     clean_code = (
         code
         .replace("```python", "")
@@ -89,12 +89,15 @@ def run_python_code(code: str) -> str:
     finally:
         sys.stdout = old_stdout
 
-    return (
-        result.strip()
-        if result.strip()
-        else "Success (no terminal output)"
-    )
+    if result.strip():
+        return result.strip()
 
+    return "Success (no terminal output)"
+
+
+# ============================================================
+# 5. TOOL - GENERATE TEST CASES
+# ============================================================
 
 @tool
 def generate_test_cases(task_description: str) -> str:
@@ -118,15 +121,28 @@ Return them as a numbered list.
 
     response = llm.invoke(prompt)
 
-    return (
-        response.content
-        if hasattr(response, "content")
-        else str(response)
-    )
+    content = response.content
+
+    if isinstance(content, list):
+
+        text_parts = []
+
+        for item in content:
+
+            if isinstance(item, dict):
+                text_parts.append(
+                    item.get("text", "")
+                )
+            else:
+                text_parts.append(str(item))
+
+        return "\n".join(text_parts)
+
+    return str(content)
 
 
 # ============================================================
-# 5. DEVELOPER NODE
+# 6. DEVELOPER NODE
 # ============================================================
 
 def developer_node(state: CrewState):
@@ -136,15 +152,15 @@ def developer_node(state: CrewState):
     dev_prompt = f"""
 You are a Python Developer.
 
-Write a clean Python script to solve this coding task:
+Write a clean Python program to solve the following coding task:
 
 {task}
 
 Rules:
-- Return ONLY Python code
-- Do not provide explanations
-- Do not use Markdown
-- Make the code executable
+- Return ONLY Python code.
+- Do NOT include explanations.
+- Do NOT use Markdown.
+- The code must be executable.
 """
 
     response = llm_flash.invoke(dev_prompt)
@@ -153,13 +169,30 @@ Rules:
 
     if isinstance(content, list):
 
-        if isinstance(content[0], dict):
-            code_str = content[0].get("text", "")
-        else:
-            code_str = str(content[0])
+        code_parts = []
+
+        for item in content:
+
+            if isinstance(item, dict):
+                code_parts.append(
+                    item.get("text", "")
+                )
+            else:
+                code_parts.append(str(item))
+
+        code_str = "\n".join(code_parts)
 
     else:
+
         code_str = str(content)
+
+    # Remove markdown fences if present
+    code_str = (
+        code_str
+        .replace("```python", "")
+        .replace("```", "")
+        .strip()
+    )
 
     return {
         "code": code_str
@@ -167,34 +200,37 @@ Rules:
 
 
 # ============================================================
-# 6. TESTER NODE
+# 7. TESTER NODE
 # ============================================================
 
 def tester_node(state: CrewState):
 
     task = state["messages"][-1].content
 
-    # Generate test cases
-    test_cases = generate_test_cases.invoke(task)
+    # --------------------------------------------------------
+    # Generate test scenarios
+    # --------------------------------------------------------
 
-    if isinstance(test_cases, list):
+    test_cases = generate_test_cases.invoke(
+        task
+    )
 
-        if isinstance(test_cases[0], dict):
-            cases_str = test_cases[0].get("text", "")
-        else:
-            cases_str = str(test_cases[0])
+    cases_str = str(test_cases)
 
-    else:
-        cases_str = str(test_cases)
+    # --------------------------------------------------------
+    # Execute generated Python code
+    # --------------------------------------------------------
 
-    # Execute generated code
     execution_result = run_python_code.invoke(
         {
             "code": state["code"]
         }
     )
 
-    # Create report
+    # --------------------------------------------------------
+    # Create final report
+    # --------------------------------------------------------
+
     report = f"""
 ### EXECUTION OUTPUT
 
@@ -212,11 +248,13 @@ def tester_node(state: CrewState):
 
 
 # ============================================================
-# 7. BUILD LANGGRAPH
+# 8. CREATE LANGGRAPH WORKFLOW
 # ============================================================
 
 workflow = StateGraph(CrewState)
 
+
+# Add nodes
 workflow.add_node(
     "developer",
     developer_node
@@ -227,26 +265,34 @@ workflow.add_node(
     tester_node
 )
 
+
+# Starting point
 workflow.add_edge(
     START,
     "developer"
 )
 
+
+# Developer → Tester
 workflow.add_edge(
     "developer",
     "tester"
 )
 
+
+# Tester → End
 workflow.add_edge(
     "tester",
     END
 )
 
+
+# Compile LangGraph
 agent = workflow.compile()
 
 
 # ============================================================
-# 8. INPUT FORMAT
+# 9. FORMAT INPUT FOR LANGGRAPH
 # ============================================================
 
 class AgentInput(TypedDict):
@@ -255,50 +301,82 @@ class AgentInput(TypedDict):
 
 def format_for_agent(x):
 
-    user_input = x["input"]
+    # Handle dictionary input from LangServe
+    if isinstance(x, dict):
+        user_input = x["input"]
+
+    else:
+        user_input = x.input
 
     return {
         "messages": [
-            HumanMessage(content=user_input)
+            HumanMessage(
+                content=user_input
+            )
         ],
-        "next_step": None,
+        "next_step": "developer",
         "code": None,
         "report": None
     }
 
 
 # ============================================================
-# 9. OUTPUT FORMAT
+# 10. FORMAT OUTPUT FOR PLAYGROUND
 # ============================================================
 
 def extract_agent_output(state):
 
+    if not isinstance(state, dict):
+
+        return {
+            "generated_code": str(state),
+            "report": ""
+        }
+
+    generated_code = state.get(
+        "code",
+        ""
+    )
+
+    report = state.get(
+        "report",
+        ""
+    )
+
     return {
-        "generated_code": state.get("code", ""),
-        "report": state.get("report", "")
+        "generated_code": generated_code or "",
+        "report": report or ""
     }
 
 
 # ============================================================
-# 10. CREATE API CHAIN
+# 11. CREATE LANGSERVE CHAIN
 # ============================================================
 
 formatted_agent_chain = (
     RunnableLambda(format_for_agent)
     | agent
     | RunnableLambda(extract_agent_output)
-).with_types(input_type=AgentInput)
+)
 
 
 # ============================================================
-# 11. FASTAPI APPLICATION
+# 12. FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
     title="LangGraph Coding Agent",
-    description="Developer and Tester Coding Agent"
+    description=(
+        "A LangGraph Developer and Tester "
+        "Coding Agent"
+    ),
+    version="1.0"
 )
 
+
+# ============================================================
+# 13. EXPOSE AGENT THROUGH LANGSERVE
+# ============================================================
 
 add_routes(
     app,
@@ -309,7 +387,20 @@ add_routes(
 
 
 # ============================================================
-# 12. RUN SERVER
+# 14. ROOT ENDPOINT
+# ============================================================
+
+@app.get("/")
+def home():
+
+    return {
+        "message": "LangGraph Coding Agent is running",
+        "status": "active"
+    }
+
+
+# ============================================================
+# 15. START SERVER
 # ============================================================
 
 if __name__ == "__main__":
